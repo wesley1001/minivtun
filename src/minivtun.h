@@ -9,24 +9,44 @@
 
 #include "library.h"
 
+extern struct minivtun_config config;
+
+struct minivtun_config {
+	unsigned reconnect_timeo;
+	unsigned keepalive_timeo;
+	char devname[40];
+	unsigned tun_mtu;
+	const char *crypto_passwd;
+	const char *pid_file;
+	bool in_background;
+	bool wait_dns;
+
+	char crypto_key[CRYPTO_MAX_KEY_SIZE];
+	const void *crypto_type;
+	struct in_addr local_tun_in;
+	struct in6_addr local_tun_in6;
+};
+
 enum {
 	MINIVTUN_MSG_KEEPALIVE,
 	MINIVTUN_MSG_IPDATA,
 	MINIVTUN_MSG_DISCONNECT,
 };
 
+#define NM_PI_BUFFER_SIZE  (1024 * 8)
+
 struct minivtun_msg {
 	struct {
 		__u8 opcode;
 		__u8 rsv[3];
-		__u8 passwd_md5sum[16];
+		__u8 auth_key[16];
 	}  __attribute__((packed)) hdr;
 
 	union {
 		struct {
 			__be16 proto;   /* ETH_P_IP or ETH_P_IPV6 */
 			__be16 ip_dlen; /* Total length of IP/IPv6 data */
-			char data[1024 * 2];
+			char data[NM_PI_BUFFER_SIZE];
 		} __attribute__((packed)) ipdata;
 		struct {
 			struct in_addr loc_tun_in;
@@ -35,38 +55,25 @@ struct minivtun_msg {
 	};
 } __attribute__((packed));
 
-#define MINIVTUN_MSG_BASIC_HLEN (sizeof(((struct minivtun_msg *)0)->hdr))
-#define MINIVTUN_MSG_IPDATA_OFFSET (offsetof(struct minivtun_msg, ipdata.data))
+#define MINIVTUN_MSG_BASIC_HLEN  (sizeof(((struct minivtun_msg *)0)->hdr))
+#define MINIVTUN_MSG_IPDATA_OFFSET  (offsetof(struct minivtun_msg, ipdata.data))
 
-#define NM_PI_BUFFER_SIZE  (1024 * 8)
+#define enabled_encryption()  (config.crypto_passwd[0])
 
-extern unsigned g_reconnect_timeo;
-extern unsigned g_keepalive_timeo;
-extern const char *g_pid_file;
-extern char g_devname[];
-extern bool g_in_background;
-
-extern AES_KEY g_encrypt_key;
-extern AES_KEY g_decrypt_key;
-extern const char *g_crypto_passwd;
-extern char g_crypto_passwd_md5sum[];
-extern struct in_addr g_local_tun_in;
-extern struct in6_addr g_local_tun_in6;
-
-static inline void local_to_netmsg(const void *in, void **out, size_t *dlen)
+static inline void local_to_netmsg(void *in, void **out, size_t *dlen)
 {
-	if (g_crypto_passwd) {
-		bytes_encrypt(&g_encrypt_key, in, *out, dlen);
+	if (enabled_encryption()) {
+		datagram_encrypt(config.crypto_key, config.crypto_type, in, *out, dlen);
 	} else {
-		*out = (void *)in;
+		*out = in;
 	}
 }
-static inline void netmsg_to_local(const void *in, void **out, size_t *dlen)
+static inline void netmsg_to_local(void *in, void **out, size_t *dlen)
 {
-	if (g_crypto_passwd) {
-		bytes_decrypt(&g_decrypt_key, in, *out, dlen);
+	if (enabled_encryption()) {
+		datagram_decrypt(config.crypto_key, config.crypto_type, in, *out, dlen);
 	} else {
-		*out = (void *)in;
+		*out = in;
 	}
 }
 

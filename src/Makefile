@@ -4,8 +4,12 @@
 # https://github.com/rssnsj/minivtun
 #
 
+ifeq ($(PREFIX),)
+PREFIX := $(shell [ -d /opt/local ] && echo /opt/local || echo /usr )
+endif
+
 CC ?= gcc
-CFLAGS ?= -Wall
+CFLAGS += -Wall
 HEADERS = minivtun.h library.h list.h jhash.h
 
 minivtun: minivtun.o library.o server.o client.o
@@ -15,10 +19,8 @@ minivtun: minivtun.o library.o server.o client.o
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 install: minivtun
-	cp -f minivtun /usr/sbin/
+	cp -f minivtun $(PREFIX)/sbin/
 
 clean:
 	rm -f minivtun *.o
 
-up:
-	rsync ../ root@rssn.cn:minivtun/ -av  --exclude='*.o' --exclude='minivtun'

@@ -17,91 +17,113 @@
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <netinet/ether.h>
-#include <linux/if.h>
-#include <linux/if_tun.h>
 
 #include "minivtun.h"
 
-unsigned g_keepalive_timeo = 13;
-unsigned g_reconnect_timeo = 60;
-const char *g_pid_file = NULL;
-const char *g_crypto_passwd = "";
-char g_crypto_passwd_md5sum[16];
-AES_KEY g_encrypt_key;
-AES_KEY g_decrypt_key;
-struct in_addr g_local_tun_in;
-struct in6_addr g_local_tun_in6;
-
-char g_devname[40];
-static unsigned g_tun_mtu = 1416;
-bool g_in_background = false;
+struct minivtun_config config = {
+	.keepalive_timeo = 13,
+	.reconnect_timeo = 60,
+	.devname = "",
+	.tun_mtu = 1416,
+	.crypto_passwd = "",
+	.crypto_type = NULL,
+	.pid_file = NULL,
+	.in_background = false,
+	.wait_dns = false,
+};
 
 static struct option long_opts[] = {
 	{ "local", required_argument, 0, 'l', },
 	{ "remote", required_argument, 0, 'r', },
+	{ "resolve", required_argument, 0, 'R', },
 	{ "ipv4-addr", required_argument, 0, 'a', },
 	{ "ipv6-addr", required_argument, 0, 'A', },
 	{ "mtu", required_argument, 0, 'm', },
-	{ "keepalive", required_argument, 0, 't', },
+	{ "keepalive", required_argument, 0, 'k', },
 	{ "ifname", required_argument, 0, 'n', },
 	{ "pidfile", required_argument, 0, 'p', },
-	{ "encryption-key", required_argument, 0, 'e', },
-	{ "no-encryption", no_argument, 0, 'N', },
+	{ "key", required_argument, 0, 'e', },
+	{ "type", required_argument, 0, 't', },
 	{ "route", required_argument, 0, 'v', },
 	{ "daemon", no_argument, 0, 'd', },
+	{ "wait-dns", no_argument, 0, 'w', },
 	{ "help", no_argument, 0, 'h', },
-	{0, 0, 0, 0},
+	{ 0, 0, 0, 0, },
 };
 
 static void print_help(int argc, char *argv[])
 {
+	int i;
+
 	printf("Mini virtual tunneller in non-standard protocol.\n");
 	printf("Usage:\n");
 	printf("  %s [options]\n", argv[0]);
 	printf("Options:\n");
-	printf("  -l, --local <ip:port>               IP:port for server to listen\n");
-	printf("  -r, --remote <ip:port>              IP:port of server to connect\n");
+	printf("  -l, --local <ip:port>               local IP:port for server to listen\n");
+	printf("  -r, --remote <host:port>            host:port of server to connect (brace with [] for bare IPv6)\n");
+	printf("  -R, --resolve <host:port>           try to resolve a hostname\n");
 	printf("  -a, --ipv4-addr <tun_lip/tun_rip>   pointopoint IPv4 pair of the virtual interface\n");
 	printf("                  <tun_lip/pfx_len>   IPv4 address/prefix length pair\n");
 	printf("  -A, --ipv6-addr <tun_ip6/pfx_len>   IPv6 address/prefix length pair\n");
-	printf("  -m, --mtu <mtu>                     set MTU size, default: %u.\n", g_tun_mtu);
-	printf("  -t, --keepalive <keepalive_timeo>   interval of keep-alive packets, default: %u\n", g_keepalive_timeo);
+	printf("  -m, --mtu <mtu>                     set MTU size, default: %u.\n", config.tun_mtu);
+	printf("  -k, --keepalive <keepalive_timeo>   interval of keep-alive packets, default: %u\n", config.keepalive_timeo);
 	printf("  -n, --ifname <ifname>               virtual interface name\n");
 	printf("  -p, --pidfile <pid_file>            PID file of the daemon\n");
-	printf("  -e, --encryption-key <encrypt_key>  shared password for data encryption\n");
+	printf("  -e, --key <encryption_key>          shared password for data encryption\n");
+	printf("  -t, --type <encryption_type>        encryption type\n");
 	printf("  -v, --route <network/prefix=gateway>\n");
 	printf("                                      route a network to a client address, can be multiple\n");
-	printf("  -N                                  turn off encryption for tunnelling data\n");
-	printf("  -d                                  run as daemon process\n");
-	printf("  -h                                  print this help\n");
+	printf("  -w, --wait-dns                      wait for DNS resolve ready after service started.\n");
+	printf("  -d, --daemon                        run as daemon process\n");
+	printf("  -h, --help                          print this help\n");
+	printf("Supported encryption types:\n");
+	printf("  ");
+	for (i = 0; cipher_pairs[i].name; i++)
+		printf("%s, ", cipher_pairs[i].name);
+	printf("\n");
 }
 
 static int tun_alloc(char *dev)
 {
-	struct ifreq ifr;
-	int fd, err;
+	int fd = -1, err;
+#ifdef __APPLE__
+	int b_enable = 1, i;
 
-	if ((fd = open("/dev/net/tun", O_RDWR)) < 0) {
-		if ((fd = open("/dev/tun", O_RDWR)) < 0)
-			return -1;
+	for (i = 0; i < 8; i++) {
+		char dev_path[20];
+		sprintf(dev_path, "/dev/tun%d", i);
+		if ((fd = open(dev_path, O_RDWR)) >= 0) {
+			sprintf(dev, "tun%d", i);
+			break;
+		}
+	}
+	if (fd < 0)
+		return -EINVAL;
+
+	if ((err = ioctl(fd, TUNSIFHEAD, &b_enable)) < 0) {
+		close(fd);
+		return err;
+	}
+#else
+	struct ifreq ifr;
+
+	if ((fd = open("/dev/net/tun", O_RDWR)) >= 0) {
+	} else if ((fd = open("/dev/tun", O_RDWR)) >= 0) {
+	} else {
+		return -EINVAL;
 	}
 
 	memset(&ifr, 0, sizeof(ifr));
-	/* Flags: IFF_TUN   - TUN device (no Ethernet headers)
-	 *        IFF_TAP   - TAP device
-	 *
-	 *        IFF_NO_PI - Do not provide packet information
-	 */
 	ifr.ifr_flags = IFF_TUN;
-	if (*dev)
+	if (dev[0])
 		strncpy(ifr.ifr_name, dev, IFNAMSIZ);
-
-	if ((err = ioctl(fd, TUNSETIFF, (void *) &ifr)) < 0){
+	if ((err = ioctl(fd, TUNSETIFF, (void *) &ifr)) < 0) {
 		close(fd);
 		return err;
 	}
 	strcpy(dev, ifr.ifr_name);
+#endif
+
 	return fd;
 }
 
@@ -136,15 +158,30 @@ static void parse_virtual_route(const char *arg)
 	vt_route_add(&network, prefix, &gateway);
 }
 
+static int try_resolve_addr_pair(const char *addr_pair)
+{
+	struct sockaddr_inx inx;
+	char s_addr[50] = "";
+	int rc;
+
+	if ((rc = get_sockaddr_inx_pair(addr_pair, &inx)) < 0)
+		return 1;
+
+	inet_ntop(inx.sa.sa_family, addr_of_sockaddr(&inx), s_addr, sizeof(s_addr));
+	printf("[%s]:%u\n", s_addr, ntohs(port_of_sockaddr(&inx)));
+
+	return 0;
+}
+
 int main(int argc, char *argv[])
 {
 	const char *tun_ip_config = NULL, *tun_ip6_config = NULL;
-	const char *loc_addr_pair = NULL;
-	const char *peer_addr_pair = NULL;
-	char cmd[100];
+	const char *loc_addr_pair = NULL, *peer_addr_pair = NULL;
+	const char *crypto_type = CRYPTO_DEFAULT_ALGORITHM;
+	char cmd[128];
 	int tunfd, opt;
 
-	while ((opt = getopt_long(argc, argv, "r:l:a:A:m:t:n:p:e:v:Ndh",
+	while ((opt = getopt_long(argc, argv, "r:l:R:a:A:m:k:n:p:e:t:v:dwh",
 			long_opts, NULL)) != -1) {
 
 		switch (opt) {
@@ -154,6 +191,9 @@ int main(int argc, char *argv[])
 		case 'r':
 			peer_addr_pair = optarg;
 			break;
+		case 'R':
+			exit(try_resolve_addr_pair(optarg));
+			break;
 		case 'a':
 			tun_ip_config = optarg;
 			break;
@@ -161,29 +201,32 @@ int main(int argc, char *argv[])
 			tun_ip6_config = optarg;
 			break;
 		case 'm':
-			g_tun_mtu = (unsigned)strtoul(optarg, NULL, 10);
+			config.tun_mtu = (unsigned)strtoul(optarg, NULL, 10);
 			break;
-		case 't':
-			g_keepalive_timeo = (unsigned)strtoul(optarg, NULL, 10);
+		case 'k':
+			config.keepalive_timeo = (unsigned)strtoul(optarg, NULL, 10);
 			break;
 		case 'n':
-			strncpy(g_devname, optarg, sizeof(g_devname) - 1);
-			g_devname[sizeof(g_devname) - 1] = '\0';
+			strncpy(config.devname, optarg, sizeof(config.devname) - 1);
+			config.devname[sizeof(config.devname) - 1] = '\0';
 			break;
 		case 'p':
-			g_pid_file = optarg;
+			config.pid_file = optarg;
 			break;
 		case 'e':
-			g_crypto_passwd = optarg;
+			config.crypto_passwd = optarg;
+			break;
+		case 't':
+			crypto_type = optarg;
 			break;
 		case 'v':
 			parse_virtual_route(optarg);
 			break;
-		case 'N':
-			g_crypto_passwd = NULL;
-			break;
 		case 'd':
-			g_in_background = true;
+			config.in_background = true;
+			break;
+		case 'w':
+			config.wait_dns = true;
 			break;
 		case 'h':
 			print_help(argc, argv);
@@ -194,9 +237,9 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (strlen(g_devname) == 0)
-		strcpy(g_devname, "mv%d");
-	if ((tunfd = tun_alloc(g_devname)) < 0) {
+	if (strlen(config.devname) == 0)
+		strcpy(config.devname, "mv%d");
+	if ((tunfd = tun_alloc(config.devname)) < 0) {
 		fprintf(stderr, "*** open_tun() failed: %s.\n", strerror(errno));
 		exit(1);
 	}
@@ -205,7 +248,7 @@ int main(int argc, char *argv[])
 	if (tun_ip_config) {
 		char s_lip[20], s_rip[20], *sp;
 		struct in_addr vaddr;
-		int na = 0;
+		int pfxlen = 0;
 
 		if (!(sp = strchr(tun_ip_config, '/'))) {
 			fprintf(stderr, "*** Invalid IPv4 address pair: %s.\n", tun_ip_config);
@@ -221,16 +264,28 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "*** Invalid local IPv4 address: %s.\n", s_lip);
 			exit(1);
 		}
-		g_local_tun_in = vaddr;
+		config.local_tun_in = vaddr;
 		if (inet_pton(AF_INET, s_rip, &vaddr)) {
 			struct in_addr __network = { .s_addr = 0 };
-			sprintf(cmd, "ifconfig %s %s pointopoint %s", g_devname, s_lip, s_rip);
+#ifdef __APPLE__
+			sprintf(cmd, "ifconfig %s %s %s", config.devname, s_lip, s_rip);
+#else
+			sprintf(cmd, "ifconfig %s %s pointopoint %s", config.devname, s_lip, s_rip);
+#endif
 			vt_route_add(&__network, 0, &vaddr);
-		} else if (sscanf(s_rip, "%d", &na) == 1 && na > 0 && na < 31 ) {
-			uint32_t mask = ~((1 << (32 - na)) - 1);
+		} else if (sscanf(s_rip, "%d", &pfxlen) == 1 && pfxlen > 0 && pfxlen < 31 ) {
+			uint32_t mask = ~((1 << (32 - pfxlen)) - 1);
+#ifdef __APPLE__
+			uint32_t network = ntohl(vaddr.s_addr) & mask;
+			sprintf(s_rip, "%u.%u.%u.%u", network >> 24, (network >> 16) & 0xff,
+					(network >> 8) & 0xff, network & 0xff);
+			sprintf(cmd, "ifconfig %s %s %s && route add -net %s/%d %s >/dev/null",
+					config.devname, s_lip, s_lip, s_rip, pfxlen, s_lip);
+#else
 			sprintf(s_rip, "%u.%u.%u.%u", mask >> 24, (mask >> 16) & 0xff,
 					(mask >> 8) & 0xff, mask & 0xff);
-			sprintf(cmd, "ifconfig %s %s netmask %s", g_devname, s_lip, s_rip);
+			sprintf(cmd, "ifconfig %s %s netmask %s", config.devname, s_lip, s_rip);
+#endif
 		} else {
 			fprintf(stderr, "*** Not a legal netmask or prefix length: %s.\n",
 					s_rip);
@@ -243,7 +298,7 @@ int main(int argc, char *argv[])
 	if (tun_ip6_config) {
 		char s_lip[50], s_pfx[20], *sp;
 		struct in6_addr vaddr;
-		int pfx_len = 0;
+		int pfxlen = 0;
 
 		if (!(sp = strchr(tun_ip6_config, '/'))) {
 			fprintf(stderr, "*** Invalid IPv6 address pair: %s.\n", tun_ip6_config);
@@ -259,25 +314,32 @@ int main(int argc, char *argv[])
 			fprintf(stderr, "*** Invalid local IPv6 address: %s.\n", s_lip);
 			exit(1);
 		}
-		g_local_tun_in6 = vaddr;
-		if (!(sscanf(s_pfx, "%d", &pfx_len) == 1 && pfx_len > 0 && pfx_len <= 128)) {
+		config.local_tun_in6 = vaddr;
+		if (!(sscanf(s_pfx, "%d", &pfxlen) == 1 && pfxlen > 0 && pfxlen <= 128)) {
 			fprintf(stderr, "*** Not a legal prefix length: %s.\n", s_pfx);
 			exit(1);
 		}
 
-		sprintf(cmd, "ifconfig %s add %s/%d", g_devname, s_lip, pfx_len);
+#ifdef __APPLE__
+		sprintf(cmd, "ifconfig %s inet6 %s/%d", config.devname, s_lip, pfxlen);
+#else
+		sprintf(cmd, "ifconfig %s add %s/%d", config.devname, s_lip, pfxlen);
+#endif
 		(void)system(cmd);
 	}
 
 	/* Always bring it up with proper MTU size. */
-	sprintf(cmd, "ifconfig %s mtu %u; ifconfig %s up", g_devname, g_tun_mtu, g_devname);
+	sprintf(cmd, "ifconfig %s mtu %u; ifconfig %s up", config.devname, config.tun_mtu, config.devname);
 	(void)system(cmd);
 
-	if (g_crypto_passwd) {
-		gen_encrypt_key(&g_encrypt_key, g_crypto_passwd);
-		gen_decrypt_key(&g_decrypt_key, g_crypto_passwd);
-		gen_string_md5sum(g_crypto_passwd_md5sum, g_crypto_passwd);
+	if (enabled_encryption()) {
+		fill_with_string_md5sum(config.crypto_passwd, config.crypto_key, CRYPTO_MAX_KEY_SIZE);
+		if ((config.crypto_type = get_crypto_type(crypto_type)) == NULL) {
+			fprintf(stderr, "*** No such encryption type defined: %s.\n", crypto_type);
+			exit(1);
+		}
 	} else {
+		memset(config.crypto_key, 0x0, CRYPTO_MAX_KEY_SIZE);
 		fprintf(stderr, "*** WARNING: Transmission will not be encrypted.\n");
 	}
 
